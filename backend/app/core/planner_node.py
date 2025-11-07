@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 try:
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash",
-        google_api_key=os.getenv("GOOGLE_API_KEY", "AIzaSyDtCKotA23GXp397l_CxHDaTY5kktoPX_o")
+        google_api_key=os.getenv("GOOGLE_API_KEY", "")
     )
 except Exception as e:
     logger.warning(f"Failed to initialize Gemini LLM: {e}")
