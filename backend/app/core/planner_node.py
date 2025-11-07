@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 try:
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash",
-        google_api_key=os.getenv("GOOGLE_API_KEY", "")
+        google_api_key=os.getenv("GOOGLE_API_KEY", "AIzaSyDtCKotA23GXp397l_CxHDaTY5kktoPX_o")
     )
 except Exception as e:
     logger.warning(f"Failed to initialize Gemini LLM: {e}")
@@ -239,21 +239,25 @@ class RoadmapMakerNode:
         
         try:
             # Prepare context
-            top_skills = ranked_skills[:10]  # Limit to top 10 skills
+            max_skills = 6
+            min_skills = 5
+            top_skills = ranked_skills[:max_skills]
+            if len(top_skills) < min_skills and len(ranked_skills) >= min_skills:
+                top_skills = ranked_skills[:min_skills]
             skills_text = "\n".join([f"- {s['skill']}" for s in top_skills])
             
             role = role_context.get("role", "")
             company_name = company_info.get("name", "")
             
             prompt = ChatPromptTemplate.from_messages([
-                ("system", """You are a career coach and skill strategist. Given a list of skills that need to be learned, generate a personalized, progressive learning roadmap for each skill.
+                ("system", """You are a career coach and skill strategist. Given a focused list of core skills, generate a concise, progressive learning roadmap for each skill.
 
 For each skill, create 3 stages:
 - Beginner: Foundations and basics
 - Intermediate: Practical application
 - Job-Ready: Advanced concepts and real-world projects
 
-Each stage should include 2-3 learning resources (courses, tutorials, docs, YouTube links) with URLs when possible.
+Each stage must include exactly 1 resource. Prefer official docs, quickstart tutorials, or short (under 6 hours) materials. Keep descriptions to 10 words or fewer.
 
 Return ONLY valid JSON with this structure:
 {{
@@ -264,22 +268,19 @@ Return ONLY valid JSON with this structure:
                 {{
                     "level": "Beginner",
                     "resources": [
-                        {{"type": "docs", "title": "Airflow 101 Docs", "url": "https://airflow.apache.org/docs/", "description": "Official documentation"}},
-                        {{"type": "tutorial", "title": "YouTube Setup Tutorial", "url": "https://youtube.com/...", "description": "Setup guide"}}
+                        {{"type": "docs", "title": "Airflow Quickstart", "url": "https://airflow.apache.org/docs/", "description": "Official getting-started guide"}}
                     ]
                 }},
                 {{
                     "level": "Intermediate",
                     "resources": [
-                        {{"type": "course", "title": "ETL Project with DAGs", "url": "", "description": "Hands-on project"}},
-                        {{"type": "blog", "title": "Medium Blog: Airflow on GCP", "url": "", "description": "Best practices"}}
+                        {{"type": "tutorial", "title": "Build Your First DAG", "url": "https://youtube.com/...", "description": "Hands-on DAG walkthrough"}}
                     ]
                 }},
                 {{
                     "level": "Job-Ready",
                     "resources": [
-                        {{"type": "project", "title": "Deploy Airflow DAG on Composer", "url": "", "description": "Production deployment"}},
-                        {{"type": "project", "title": "Mini Project: Data Pipeline", "url": "", "description": "End-to-end pipeline"}}
+                        {{"type": "project", "title": "Deploy Airflow Pipeline", "url": "", "description": "Launch a production-style project"}}
                     ]
                 }}
             ]

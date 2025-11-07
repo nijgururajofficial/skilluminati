@@ -5,6 +5,7 @@ from pydantic import BaseModel
 import json
 import os
 import logging
+import re
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -60,12 +61,20 @@ class MainNode:
             Dict with parsed resume_data, jd_data, and status
         """
         # Parse resume if provided
+        logger.info("MainNode processing start | user_id=%s", input_data.user_id)
         resume_data = {}
         if input_data.resume_file_path:
             resume_data = self._parse_resume(input_data.resume_file_path)
         
         # Parse job description
         jd_data = self._parse_job_description(input_data.jd_text)
+        
+        logger.info(
+            "MainNode processing complete | user_id=%s | resume_sections=%d | jd_sections=%d",
+            input_data.user_id,
+            len(resume_data.keys()),
+            len(jd_data.keys()),
+        )
         
         return {
             "user_id": input_data.user_id,
@@ -86,6 +95,7 @@ class MainNode:
         # Load PDF if file path provided
         loader = PyPDFLoader(resume_file_path)
         documents = loader.load()
+        logger.debug("MainNode resume PDF loaded | pages=%d", len(documents))
         resume_content = "\n".join([doc.page_content for doc in documents])
         
         if not resume_content:
@@ -118,14 +128,14 @@ Return ONLY valid JSON with this structure:
         
         chain = prompt | self.llm
         response = chain.invoke({"resume_content": resume_content})
-        
+
         content = response.content
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
-        
-        resume_parsed = json.loads(content)
+        resume_parsed = self._extract_json(content, context="resume")
+        logger.info(
+            "MainNode resume parsing success | skills=%d | experience=%d",
+            len(resume_parsed.get("skills", [])),
+            len(resume_parsed.get("experience", [])),
+        )
         return {
             "skills": resume_parsed.get("skills", []),
             "experience": resume_parsed.get("experience", []),
@@ -174,14 +184,15 @@ Return ONLY valid JSON with this structure:
         
         chain = prompt | self.llm
         response = chain.invoke({"jd_text": jd_text})
-        
+
         content = response.content
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
-        
-        jd_parsed = json.loads(content)
+        jd_parsed = self._extract_json(content, context="job description")
+        logger.info(
+            "MainNode JD parsing success | company=%s | role=%s | skills=%d",
+            jd_parsed.get("company", ""),
+            jd_parsed.get("role", ""),
+            len(jd_parsed.get("required_skills", [])),
+        )
         return {
             "company": jd_parsed.get("company", ""),
             "role": jd_parsed.get("role", ""),
@@ -189,4 +200,81 @@ Return ONLY valid JSON with this structure:
             "tools": jd_parsed.get("tools", []),
             "responsibilities": jd_parsed.get("responsibilities", [])
         }
+
+    def _extract_json(self, raw_content: str, context: str) -> Dict:
+        """Extract and sanitize JSON content from model responses."""
+        if not raw_content:
+            raise ValueError(f"Empty response content while parsing {context}")
+
+        content = raw_content.strip()
+        if "```json" in content:
+            content = content.split("```json", 1)[1]
+            content = content.split("```", 1)[0]
+        elif "```" in content:
+            content = content.split("```", 1)[1]
+            content = content.split("```", 1)[0]
+
+        if "{" in content and "}" in content:
+            start = content.index("{")
+            end = content.rindex("}") + 1
+            content = content[start:end]
+
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as exc:
+            logger.debug(
+                "MainNode %s JSON parsing needs sanitization | error=%s",
+                context,
+                exc,
+            )
+
+        sanitized = self._sanitize_json_string(content)
+        try:
+            return json.loads(sanitized)
+        except json.JSONDecodeError as exc:
+            logger.error(
+                "MainNode %s JSON parsing failed | error=%s | content=%s",
+                context,
+                exc,
+                sanitized,
+            )
+            raise
+
+    @staticmethod
+    def _sanitize_json_string(content: str) -> str:
+        """Attempt to coerce near-JSON content into valid JSON."""
+        if not content:
+            return "{}"
+
+        lines = content.strip().replace("\r", "").splitlines()
+        fixed_lines = []
+        for line in lines:
+            stripped = line.strip()
+
+            # Auto-quote bare trailing string values such as   fangraph"
+            if stripped.endswith('"') and not stripped.startswith('"'):
+                has_comma = stripped.endswith('",')
+                text = stripped.rstrip(',').rstrip('"').strip()
+                if text:
+                    indent = line[: len(line) - len(line.lstrip())]
+                    stripped = f'"{text}"'
+                    if has_comma:
+                        stripped += ','
+                    line = indent + stripped
+
+            fixed_lines.append(line)
+
+        sanitized = "\n".join(fixed_lines)
+
+        # Remove trailing commas before closing braces/brackets
+        sanitized = re.sub(r",(\s*[}\]])", r"\1", sanitized)
+
+        # Replace single quotes around keys/values with double quotes when safe
+        sanitized = re.sub(r"'([^']+)'\s*:", lambda m: f'"{m.group(1)}":', sanitized)
+        sanitized = re.sub(r":\s*'([^']*)'", lambda m: f': "{m.group(1)}"', sanitized)
+
+        # Ensure adjacent quoted strings are comma separated inside arrays
+        sanitized = re.sub(r'"\s+(?=")', '", ', sanitized)
+
+        return sanitized
 

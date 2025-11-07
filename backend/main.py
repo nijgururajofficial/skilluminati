@@ -4,13 +4,14 @@ Minimal routing with LangGraph-based workflow orchestration.
 """
 
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status
+from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 import secrets
 import tempfile
 import os
 
-from app.auth.jwt_handler import get_current_user, security
-from app.auth.routes_auth import router as auth_router
+# from app.auth.jwt_handler import get_current_user, security
+# from app.auth.routes_auth import router as auth_router
 from app.models.schemas import (
     JDAnalysisResponse, Skill, CompanyInsight,
     GenerateRoadmapRequest, RoadmapResponse, Phase, Resource, Project
@@ -42,27 +43,40 @@ def custom_openapi():
         routes=app.routes,
     )
     # Add security scheme
-    openapi_schema["components"]["securitySchemes"] = {
-        "bearerAuth": {
-            "type": "http",
-            "scheme": "bearer",
-            "bearerFormat": "JWT",
-        }
-    }
+    # openapi_schema["components"]["securitySchemes"] = {
+    #     "bearerAuth": {
+    #         "type": "http",
+    #         "scheme": "bearer",
+    #         "bearerFormat": "JWT",
+    #     }
+    # }
     app.openapi_schema = openapi_schema
     return app.openapi_schema
 
 app.openapi = custom_openapi
 
+# Configure CORS to allow local frontend access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Include auth routes
-app.include_router(auth_router)
+# app.include_router(auth_router)
 
 
 @app.post("/analyze-jd", response_model=JDAnalysisResponse, status_code=status.HTTP_200_OK)
 async def analyze_job_description(
     jd_text: str = Form(...),
-    resume: Optional[UploadFile] = File(None),
-    current_user: dict = Depends(get_current_user)
+    resume: Optional[UploadFile] = File(None)
 ):
     """
     Analyze a job description and extract skills using LangGraph workflow.
@@ -86,8 +100,10 @@ async def analyze_job_description(
                 resume_file_path = tmp_file.name
         
         # Run workflow with new structure
+        user_email = "anonymous@example.com"
+
         result = run_workflow(
-            user_id=current_user["email"],
+            user_id=user_email,
             jd_text=jd_text,
             resume_file_path=resume_file_path
         )
@@ -97,6 +113,8 @@ async def analyze_job_description(
         role_context = result.get("role_context", {})
         company_info = result.get("company_info", {})
         skill_insights = result.get("skill_insights", [])
+        ranked_skills = result.get("ranked_skills", [])
+        skill_gap_analysis = result.get("skill_gap_analysis", {})
         
         # Get role from jd_data or role_context
         role = jd_data.get("role") or role_context.get("role", "Unknown")
@@ -105,18 +123,67 @@ async def analyze_job_description(
         required_skills = jd_data.get("required_skills", [])
         skills = []
         
-        # Map skills to Skill objects with priority from skill_insights
-        for skill_name in required_skills:
-            # Find matching skill insight for priority/importance
+        ranked_order = [rs for rs in ranked_skills if rs.get("skill")]
+
+        max_skills = 8
+        min_skills = 5
+        selected_ranked = ranked_order[:max_skills]
+        if len(selected_ranked) < min_skills and len(ranked_order) >= min_skills:
+            selected_ranked = ranked_order[:min_skills]
+
+        ranked_map = {
+            rs.get("skill", "").lower(): rs for rs in selected_ranked
+        }
+        missing_set = {s.lower() for s in skill_gap_analysis.get("missing_skills", [])}
+        weak_set = {s.lower() for s in skill_gap_analysis.get("weak_skills", [])}
+        matched_set = {s.lower() for s in skill_gap_analysis.get("matched_skills", [])}
+
+        def _derive_priority_and_score(skill_name: str) -> tuple[str, int]:
+            key = skill_name.lower()
+            ranked = ranked_map.get(key)
+
+            if ranked:
+                priority_score = ranked.get("priority_score", 0.0)
+                gap_type = ranked.get("gap_type", "missing")
+
+                if gap_type == "missing":
+                    priority_label = "must-have"
+                    importance = max(7, min(10, int(round(priority_score * 10))))
+                elif gap_type == "weak":
+                    priority_label = "nice-to-have"
+                    importance = max(5, min(9, int(round(priority_score * 10))))
+                else:
+                    priority_label = "optional"
+                    importance = max(3, min(7, int(round(priority_score * 10))))
+
+                return priority_label, importance
+
+            if key in missing_set:
+                return "must-have", 9
+            if key in weak_set:
+                return "nice-to-have", 7
+            if key in matched_set:
+                return "must-have", 6
+
+            return "optional", 5
+
+        selected_skill_names = [rs.get("skill") for rs in selected_ranked if rs.get("skill")]
+
+        if not selected_skill_names:
+            fallback_skills = required_skills[:max_skills]
+            if len(fallback_skills) < min_skills and len(required_skills) >= min_skills:
+                fallback_skills = required_skills[:min_skills]
+            selected_skill_names = fallback_skills
+
+        # Map skills to Skill objects with derived priority and importance
+        for skill_name in selected_skill_names:
             insight = next(
                 (si for si in skill_insights if si.get("skill_name", "").lower() == skill_name.lower()),
                 None
             )
-            
-            # Determine priority based on skill insights or default
-            priority = "must-have"  # Default for required skills
-            importance_score = 8  # Default score
-            
+
+            priority, importance_score = _derive_priority_and_score(skill_name)
+
             skills.append(Skill(
                 name=skill_name,
                 priority=priority,
@@ -149,7 +216,7 @@ async def analyze_job_description(
             "role": role,
             "skills": [skill.dict() for skill in skills],
             "company_insights": [insight.dict() for insight in company_insights],
-            "user_email": current_user["email"],
+            "user_email": user_email,
             "workflow_result": result
         }
         
@@ -175,8 +242,7 @@ async def analyze_job_description(
 
 @app.post("/generate-roadmap", response_model=RoadmapResponse, status_code=status.HTTP_201_CREATED)
 async def generate_roadmap(
-    request: GenerateRoadmapRequest,
-    current_user: dict = Depends(get_current_user)
+    request: GenerateRoadmapRequest
 ):
     """
     Generate a learning roadmap based on a JD analysis.
@@ -353,6 +419,7 @@ async def generate_roadmap(
     # Generate roadmap ID and store
     roadmap_id = f"roadmap_{secrets.token_urlsafe(8)}"
     roadmaps_db = get_roadmaps_db()
+    user_email = "anonymous@example.com"
     total_skills = len(ranked_skills) if ranked_skills else len(jd_data.get("skills", []))
     
     roadmaps_db[roadmap_id] = {
@@ -362,7 +429,7 @@ async def generate_roadmap(
         "phases": [phase.dict() for phase in phases],
         "total_skills": total_skills,
         "estimated_weeks": len(phases),
-        "user_email": current_user["email"]
+        "user_email": user_email
     }
     
     return RoadmapResponse(
@@ -376,12 +443,12 @@ async def generate_roadmap(
 
 
 @app.get("/user/roadmaps")
-async def get_user_roadmaps(current_user: dict = Depends(get_current_user)):
+async def get_user_roadmaps():  # Depends(get_current_user)
     """Get all roadmaps for the current user."""
     roadmaps_db = get_roadmaps_db()
     user_roadmaps = [
         roadmap for roadmap in roadmaps_db.values()
-        if roadmap.get("user_email") == current_user["email"]
+        if roadmap.get("user_email") == "anonymous@example.com"
     ]
     return {"roadmaps": user_roadmaps}
 
